@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 #include <argp.h>
+#include "env_tag_filter.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
@@ -31,6 +32,7 @@ struct env {
 	char *comm;
 	bool all_fds;
 	int max_bytes;
+	char *env_tag;
 } env = {
 	.pid = INVALID_PID,
 	.uid = INVALID_UID,
@@ -54,7 +56,23 @@ const char argp_program_doc[] =
 enum {
 	OPT_ALL_FDS = 1001,
 	OPT_MAX_BYTES,
+	OPT_ENV_FILTER,
 };
+
+/* env-tag filter state + per-pid admission cache. */
+static struct env_tag_filter g_env_tag_filter;
+static struct env_tag_pid_cache g_env_tag_pid_cache;
+
+/* Returns true when the event PID passes the --env-filter tag test
+ * (or when the filter is disabled). Uses the decision cache to avoid
+ * re-reading /proc/<pid>/environ per event.
+ */
+static inline bool stdio_event_admit(pid_t pid)
+{
+	if (!g_env_tag_filter.enabled)
+		return true;
+	return env_tag_admit_pid_cached(&g_env_tag_filter, &g_env_tag_pid_cache, pid);
+}
 
 static const struct argp_option opts[] = {
 	{"pid", 'p', "PID", 0, "Trace this PID only."},
@@ -62,6 +80,7 @@ static const struct argp_option opts[] = {
 	{"comm", 'c', "COMMAND", 0, "Trace only commands matching string."},
 	{"all-fds", OPT_ALL_FDS, NULL, 0, "Capture all FDs instead of only stdin/stdout/stderr."},
 	{"max-bytes", OPT_MAX_BYTES, "BYTES", 0, "Maximum bytes to emit per event (default 8192)."},
+	{"env-filter", OPT_ENV_FILTER, "KEY=VALUE", 0, "Only capture processes whose /proc/<pid>/environ contains this exact KEY=VALUE entry. Makes -p optional."},
 	{"verbose", 'v', NULL, 0, "Verbose libbpf debug output."},
 	{},
 };
@@ -91,9 +110,12 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		if (env.max_bytes > MAX_BUF_SIZE)
 			env.max_bytes = MAX_BUF_SIZE;
 		break;
+	case OPT_ENV_FILTER:
+		env.env_tag = strdup(arg);
+		break;
 	case ARGP_KEY_END:
-		if (env.pid == INVALID_PID)
-			argp_error(state, "-p/--pid is required");
+		if (env.pid == INVALID_PID && !env.env_tag)
+			argp_error(state, "-p/--pid or --env-filter is required");
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -237,6 +259,10 @@ static void print_event(const struct stdiocap_event_t *event)
 	if (env.comm && strcmp(env.comm, event->comm) != 0)
 		return;
 
+	/* Drop events whose PID does not match --env-filter. */
+	if (!stdio_event_admit((pid_t)event->pid))
+		return;
+
 	if (!event_buf)
 		return;
 
@@ -303,6 +329,13 @@ int main(int argc, char **argv)
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
+
+	if (env.env_tag) {
+		env_tag_filter_init(&g_env_tag_filter, env.env_tag);
+		env_tag_pid_cache_reset(&g_env_tag_pid_cache);
+		if (g_env_tag_filter.enabled)
+			fprintf(stderr, "stdiocap env-filter enabled: %s\n", env.env_tag);
+	}
 
 	setlocale(LC_ALL, "");
 	libbpf_set_print(libbpf_print_fn);

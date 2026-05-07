@@ -4,6 +4,7 @@
 // Based on sslsniff from BCC by Adrian Lopez & Mark Drayton.
 // 15-Aug-2023   Yusheng Zheng   Created this.
 #include <argp.h>
+#include "env_tag_filter.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <ctype.h>
@@ -108,6 +109,7 @@ struct env {
 	bool nss;
 	bool handshake;
 	char *extra_lib;
+	char *env_tag;
 } env = {
 	.uid = INVALID_UID,
 	.pid = INVALID_PID,
@@ -119,6 +121,23 @@ struct env {
 };
 
 #define EXTRA_LIB_KEY 1003
+#define ENV_FILTER_KEY 1004
+
+/* env-tag filter state + per-pid admission cache. */
+static struct env_tag_filter g_env_tag_filter;
+static struct env_tag_pid_cache g_env_tag_pid_cache;
+
+/* Returns true when the events PID passes the --env-filter tag test
+ * (or when the filter is disabled). Uses the decision cache to avoid
+ * re-reading /proc/<pid>/environ per event.
+ */
+static inline bool ssl_event_admit(pid_t pid)
+{
+	if (!g_env_tag_filter.enabled)
+		return true;
+	return env_tag_admit_pid_cached(&g_env_tag_filter, &g_env_tag_pid_cache, pid);
+}
+
 
 static const struct argp_option opts[] = {
 	{"pid", 'p', "PID", 0, "Sniff this PID only."},
@@ -130,6 +149,7 @@ static const struct argp_option opts[] = {
 	{"handshake", 'h', NULL, 0, "Show handshake events."},
 	{"verbose", 'v', NULL, 0, "Verbose debug output"},
 	{"binary-path", EXTRA_LIB_KEY, "PATH", 0, "Attach to specific binary (e.g., ~/.nvm/versions/node/v20.0.0/bin/node)."},
+	{"env-filter", ENV_FILTER_KEY, "KEY=VALUE", 0, "Only emit events for processes whose /proc/<pid>/environ contains this exact KEY=VALUE entry."},
 	{},
 };
 
@@ -305,6 +325,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state) {
 		break;
 	case EXTRA_LIB_KEY:
 		env.extra_lib = strdup(arg);
+		break;
+	case ENV_FILTER_KEY:
+		env.env_tag = strdup(arg);
 		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
@@ -601,6 +624,11 @@ void print_event(struct probe_SSL_data_t *event, const char *evt) {
 		return;
 	}
 
+	/* Drop events from processes that do not match --env-filter. */
+	if (!ssl_event_admit(event->pid)) {
+		return;
+	}
+
 	if (start == 0) {
 		start = event->timestamp_ns;
 	}
@@ -716,6 +744,12 @@ int main(int argc, char **argv) {
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
+	if (!err && env.env_tag) {
+		env_tag_filter_init(&g_env_tag_filter, env.env_tag);
+		env_tag_pid_cache_reset(&g_env_tag_pid_cache);
+		if (g_env_tag_filter.enabled)
+			fprintf(stderr, "sslsniff env-filter enabled: %s\n", env.env_tag);
+	}
 	if (err)
 		return err;
 
@@ -773,7 +807,11 @@ int main(int argc, char **argv) {
 			warn("OpenSSL library not found\n");
 		}
 
-		/* Scan for additional SSL libraries in container processes */
+		/* Scan for additional SSL libraries in container processes.
+		 * When --env-filter is active, we pre-filter the PID list so we do
+		 * not attach 10 uprobes per container that we would later ignore at
+		 * event time. Each container attach consumes ~10 fds, which quickly
+		 * exhausts RLIMIT_NOFILE on busy hosts. */
 		if (env.pid <= 0) {
 			struct pid_lib_entry entries[MAX_CONTAINER_LIBS];
 			int count = find_pids_with_library("libssl.so", entries,
@@ -783,6 +821,17 @@ int main(int argc, char **argv) {
 				if (openssl_path &&
 				    strcmp(entries[i].lib_path, openssl_path) == 0)
 					continue;
+				/* env-filter: skip PIDs that do not carry the tag. */
+				if (g_env_tag_filter.enabled &&
+				    !env_tag_admit_pid_cached(&g_env_tag_filter,
+				                              &g_env_tag_pid_cache,
+				                              entries[i].pid)) {
+					if (verbose)
+						fprintf(stderr,
+							"env-filter: skip container lib for PID %d (%s)\n",
+							entries[i].pid, entries[i].lib_path);
+					continue;
+				}
 				if (verbose)
 					fprintf(stderr,
 						"Attaching uprobe to container lib: %s\n",
