@@ -22,6 +22,7 @@
 #include "process_ext/map_flush.h"
 #include "process_ext/mem_info.h"
 #include "process_ext/resource_sampler.h"
+#include "env_tag_filter.h"
 
 #define MAX_COMMAND_LIST 256
 #define FILE_DEDUP_WINDOW_NS 60000000000ULL  /* 60 seconds */
@@ -78,6 +79,7 @@ static struct env {
 	char cgroup_filter_path[256];
 	bool cgroup_filter_enabled;
 	bool cgroup_filter_children;
+	char env_tag[128];   /* --env-filter: KEY=VALUE string, empty when disabled */
 } env = {
 	.verbose = false,
 	.min_duration_ms = 0,
@@ -88,6 +90,7 @@ static struct env {
 };
 
 static struct pid_tracker pid_tracker;
+static struct env_tag_filter g_env_tag_filter;
 
 /* BPF skeleton and map FDs (set in main, used in handle_event) */
 static struct process_new_bpf *g_skel;
@@ -130,6 +133,7 @@ enum {
 	OPT_CGROUP,
 	OPT_CGROUP_FILTER,
 	OPT_CGROUP_FILTER_CHILDREN,
+	OPT_ENV_FILTER,
 };
 
 static const struct argp_option opts[] = {
@@ -151,6 +155,7 @@ static const struct argp_option opts[] = {
 	{ "cgroup", OPT_CGROUP, "PATH", 0, "Cgroup v2 path for resource sampling (auto-detected if omitted)" },
 	{ "cgroup-filter", OPT_CGROUP_FILTER, "PATH", 0, "Hard filter by cgroup v2 path (container-level isolation)" },
 	{ "cgroup-filter-children", OPT_CGROUP_FILTER_CHILDREN, NULL, 0, "Include descendants of --cgroup-filter path (sub-cgroup match)" },
+	{ "env-filter", OPT_ENV_FILTER, "KEY=VALUE", 0, "Only track processes whose /proc/<pid>/environ contains this exact KEY=VALUE entry (children inherit)" },
 	{},
 };
 
@@ -264,6 +269,10 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case OPT_CGROUP_FILTER_CHILDREN:
 		env.cgroup_filter_children = true;
+		break;
+	case OPT_ENV_FILTER:
+		strncpy(env.env_tag, arg, sizeof(env.env_tag) - 1);
+		env.env_tag[sizeof(env.env_tag) - 1] = '\0';
 		break;
 	case ARGP_KEY_ARG:
 		argp_usage(state);
@@ -488,6 +497,38 @@ static bool should_rate_limit_file(const struct event *e, uint64_t timestamp_ns,
 
 /* ========== FILE_OPEN print + dedup (copied from process.c) ========== */
 
+/* Parse open(2) flags into a human-readable mode string.
+ * Returns pointer to a static buffer; intended for single-threaded use
+ * inside the event handler. Examples: "READ", "WRITE|CREAT|TRUNC".
+ */
+static const char *resolve_open_mode(int flags)
+{
+	static char buf[96];
+	int access = flags & 0x3;  /* O_ACCMODE */
+	const char *base;
+	int n;
+
+	switch (access) {
+	case 0:  base = "READ";    break;
+	case 1:  base = "WRITE";   break;
+	case 2:  base = "RDWR";    break;
+	default: base = "UNKNOWN"; break;
+	}
+
+	n = snprintf(buf, sizeof(buf), "%s", base);
+	if ((flags & 0x40)    && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|CREAT");
+	if ((flags & 0x200)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|TRUNC");
+	if ((flags & 0x400)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|APPEND");
+	if ((flags & 0x80)    && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|EXCL");
+	if ((flags & 0x800)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|NONBLOCK");
+	if ((flags & 0x1000)  && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|DSYNC");
+	if ((flags & 0x101000)&& n < (int)sizeof(buf)) {} /* O_SYNC = O_DSYNC|__O_SYNC */
+	if ((flags & 0x80000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|CLOEXEC");
+	if ((flags & 0x10000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|DIRECTORY");
+	if ((flags & 0x20000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|NOFOLLOW");
+	return buf;
+}
+
 static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, uint32_t count, const char *extra_fields)
 {
 	printf("{");
@@ -497,6 +538,7 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 	printf("\"pid\":%d,", e->pid);
 	printf("\"count\":%u,", count);
 	printf("\"filepath\":\"%s\",", e->file_op.filepath);
+	printf("\"mode\":\"%s\",", resolve_open_mode(e->file_op.flags));
 	printf("\"flags\":%d", e->file_op.flags);
 	if (extra_fields && strlen(extra_fields) > 0)
 		printf(",%s", extra_fields);
@@ -603,6 +645,28 @@ static void flush_pid_file_opens(pid_t pid, uint64_t timestamp_ns)
 	}
 }
 
+
+/* Decide whether a process should be admitted under --env-filter.
+ *
+ * When env-tag filter is NOT enabled, defer to the regular filter logic
+ * (returns true, meaning "don't veto").
+ *
+ * When env-tag filter IS enabled, admit the process only if:
+ *   - its /proc/<pid>/environ contains the configured KEY=VALUE entry, OR
+ *   - its ppid is already being tracked (child of a tagged ancestor).
+ *
+ * This runs in userspace on every EXEC before we add the pid to the
+ * tracked_pids BPF map.
+ */
+static bool env_tag_should_admit(struct pid_tracker *tracker, pid_t pid, pid_t ppid)
+{
+	if (!g_env_tag_filter.enabled)
+		return true;
+	if (pid_tracker_is_tracked(tracker, ppid))
+		return true;
+	return env_tag_match_pid(&g_env_tag_filter, pid);
+}
+
 /* ========== Populate initial PIDs ========== */
 
 static int populate_initial_pids(struct pid_tracker *tracker)
@@ -628,7 +692,8 @@ static int populate_initial_pids(struct pid_tracker *tracker)
 		if (read_proc_ppid(pid, &ppid) != 0)
 			continue;
 
-		if (should_track_process(tracker, comm, pid, ppid)) {
+		if (should_track_process(tracker, comm, pid, ppid) &&
+		    env_tag_should_admit(tracker, pid, ppid)) {
 			if (pid_tracker_add(tracker, pid, ppid)) {
 				tracked_count++;
 				/* Also add to BPF tracked_pids map */
@@ -665,7 +730,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				bpf_map_delete_elem(g_tracked_pids_fd, &bpf_pid);
 			}
 
-			if (!is_tracked && tracker->filter_mode == FILTER_MODE_FILTER)
+			if (!is_tracked && (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled))
 				break;
 
 			printf("{\"timestamp\":%llu,\"event\":\"EXIT\","
@@ -697,7 +762,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			if (g_agg_map_fd >= 0)
 				flush_pid_from_agg_map(g_agg_map_fd, e->pid);
 		} else {
-			if (should_track_process(tracker, e->comm, e->pid, e->ppid)) {
+			if (should_track_process(tracker, e->comm, e->pid, e->ppid) &&
+			    env_tag_should_admit(tracker, e->pid, e->ppid)) {
 				pid_tracker_add(tracker, e->pid, e->ppid);
 
 				/* Set resource sampling target from first matching EXEC */
@@ -735,7 +801,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				print_container_fields(e->pid);
 				printf("}\n");
 				fflush(stdout);
-			} else if (tracker->filter_mode == FILTER_MODE_FILTER) {
+			} else if (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled) {
+				/* FILTER mode rejects unmatched; env-filter vetoes non-tagged procs */
 				break;
 			} else {
 				if (tracker->filter_mode == FILTER_MODE_PROC)
@@ -807,6 +874,13 @@ int main(int argc, char **argv)
 		page_size_kb = 4;
 
 	pid_tracker_init(&pid_tracker, env.command_list, env.command_count, env.filter_mode, env.pid);
+	if (env.env_tag[0] != '\0') {
+		if (!env_tag_filter_init(&g_env_tag_filter, env.env_tag)) {
+			fprintf(stderr, "Invalid --env-filter value (expect KEY=VALUE): %s\n", env.env_tag);
+			return 1;
+		}
+		fprintf(stderr, "env-filter enabled: only tracking processes with %s (and their children)\n", g_env_tag_filter.tag);
+	}
 	libbpf_set_print(libbpf_print_fn);
 
 	signal(SIGINT, sig_handler);
@@ -827,8 +901,9 @@ int main(int argc, char **argv)
 	skel->rodata->trace_cow = env.trace_cow;
 
 	/* Enable BPF-side PID filtering when command/pid filters are set */
-	bool need_pid_filter = (env.filter_mode == FILTER_MODE_FILTER) &&
-			       (env.command_count > 0 || env.pid > 0);
+	bool need_pid_filter = ((env.filter_mode == FILTER_MODE_FILTER) &&
+			       (env.command_count > 0 || env.pid > 0)) ||
+			       g_env_tag_filter.enabled;
 	skel->rodata->filter_pids = need_pid_filter;
 
 	/* Optional hard cgroup filter for container-level isolation */

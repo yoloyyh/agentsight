@@ -14,6 +14,7 @@
 #include "process.skel.h"
 #include "process_utils.h"
 #include "process_filter.h"
+#include "env_tag_filter.h"
 
 #define MAX_COMMAND_LIST 256
 #define FILE_DEDUP_WINDOW_NS 60000000000ULL  // 60 seconds in nanoseconds
@@ -54,6 +55,7 @@ static struct env {
 	int command_count;
 	enum filter_mode filter_mode;
 	pid_t pid;
+	char env_tag[128];
 } env = {
 	.verbose = false,
 	.min_duration_ms = 0,
@@ -64,6 +66,7 @@ static struct env {
 
 /* Global PID tracker for userspace filtering */
 static struct pid_tracker pid_tracker;
+static struct env_tag_filter g_env_tag_filter;
 
 const char *argp_program_version = "process-tracer 1.0";
 const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
@@ -85,7 +88,8 @@ const char argp_program_doc[] =
 "  ./process -m 1                   # Trace all processes, selective read/write\n"
 "  ./process -c \"claude,python\"    # Trace only claude/python processes\n"
 "  ./process -c \"ssh\" -d 1000     # Trace ssh processes lasting > 1 second\n"
-"  ./process -p 1234                # Trace only PID 1234\n";
+"  ./process -p 1234                # Trace only PID 1234\n"
+"  ./process --env-filter AGENTSIGHT_TAG=true  # Only tagged procs + children\n";
 
 static const struct argp_option opts[] = {
 	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
@@ -94,6 +98,7 @@ static const struct argp_option opts[] = {
 	{ "pid", 'p', "PID", 0, "Trace this PID only" },
 	{ "mode", 'm', "FILTER-MODE", 0, "Filter mode: 0=all, 1=proc, 2=filter (default=2)" },
 	{ "all", 'a', NULL, 0, "Deprecated: use -m 0 instead" },
+	{ "env-filter", 'E', "KEY=VALUE", 0, "Only track processes whose /proc/<pid>/environ contains this exact KEY=VALUE entry (children inherit)" },
 	{},
 };
 
@@ -125,6 +130,10 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'a':
 		env.filter_mode = FILTER_MODE_ALL;
+		break;
+	case 'E':
+		strncpy(env.env_tag, arg, sizeof(env.env_tag) - 1);
+		env.env_tag[sizeof(env.env_tag) - 1] = '\0';
 		break;
 	case 'm':
 		errno = 0;
@@ -234,6 +243,36 @@ static bool should_rate_limit_file(const struct event *e, uint64_t timestamp_ns,
     return false;
 }
 
+// Parse open(2) flags into a human-readable mode string.
+// Returns pointer to a static buffer; intended for single-threaded use
+// inside the event handler. Examples: "READ", "WRITE|CREAT|TRUNC".
+static const char *resolve_open_mode(int flags)
+{
+	static char buf[96];
+	int access = flags & 0x3;  /* O_ACCMODE */
+	const char *base;
+	int n;
+
+	switch (access) {
+	case 0:  base = "READ";    break;
+	case 1:  base = "WRITE";   break;
+	case 2:  base = "RDWR";    break;
+	default: base = "UNKNOWN"; break;
+	}
+
+	n = snprintf(buf, sizeof(buf), "%s", base);
+	if ((flags & 0x40)    && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|CREAT");
+	if ((flags & 0x200)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|TRUNC");
+	if ((flags & 0x400)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|APPEND");
+	if ((flags & 0x80)    && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|EXCL");
+	if ((flags & 0x800)   && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|NONBLOCK");
+	if ((flags & 0x1000)  && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|DSYNC");
+	if ((flags & 0x80000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|CLOEXEC");
+	if ((flags & 0x10000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|DIRECTORY");
+	if ((flags & 0x20000) && n < (int)sizeof(buf)) n += snprintf(buf + n, sizeof(buf) - n, "|NOFOLLOW");
+	return buf;
+}
+
 // Shared function to print FILE_OPEN events
 static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, uint32_t count, const char *extra_fields)
 {
@@ -244,6 +283,7 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 	printf("\"pid\":%d,", e->pid);
 	printf("\"count\":%u,", count);
 	printf("\"filepath\":\"%s\",", e->file_op.filepath);
+	printf("\"mode\":\"%s\",", resolve_open_mode(e->file_op.flags));
 	printf("\"flags\":%d", e->file_op.flags);
 	
 	if (extra_fields && strlen(extra_fields) > 0) {
@@ -425,6 +465,48 @@ static void sig_handler(int sig)
 }
 
 /* Populate initial PIDs in the userspace tracker from existing processes */
+
+/* Decide whether a process should be admitted under --env-filter. */
+static bool env_tag_should_admit(struct pid_tracker *tracker, pid_t pid, pid_t ppid)
+{
+	if (!g_env_tag_filter.enabled)
+		return true;
+	if (pid_tracker_is_tracked(tracker, ppid))
+		return true;
+	return env_tag_match_pid(&g_env_tag_filter, pid);
+}
+
+/*
+ * Unified admission gate. When --env-filter is active it overrides the normal
+ * filter_mode rules (which would otherwise reject everything in FILTER mode
+ * unless -c/-p matched). When env-filter is disabled, fall back to the
+ * existing should_track_process() logic.
+ */
+static bool admit_process(struct pid_tracker *tracker, const char *comm,
+                          pid_t pid, pid_t ppid)
+{
+	if (g_env_tag_filter.enabled)
+		return env_tag_should_admit(tracker, pid, ppid);
+	return should_track_process(tracker, comm, pid, ppid);
+}
+
+/*
+ * Per-event reporting gate. BASH_READLINE fires on every interactive bash
+ * in the system, not just the ones we are tracking. Without this gate,
+ * --env-filter would correctly suppress EXEC/EXIT/FILE_OPEN for an
+ * untagged shell but still leak its typed commands. Centralising the
+ * decision here keeps should_report_bash_readline() and friends in sync
+ * with admit_process().
+ */
+static bool should_emit_event_for_pid(struct pid_tracker *tracker, pid_t pid)
+{
+	if (g_env_tag_filter.enabled)
+		return pid_tracker_is_tracked(tracker, pid);
+	if (tracker->filter_mode == FILTER_MODE_FILTER)
+		return pid_tracker_is_tracked(tracker, pid);
+	return true;
+}
+
 static int populate_initial_pids(struct pid_tracker *tracker, char **command_list, int command_count, enum filter_mode filter_mode)
 {
 	DIR *proc_dir;
@@ -457,7 +539,7 @@ static int populate_initial_pids(struct pid_tracker *tracker, char **command_lis
 			continue;
 
 		/* Check if we should track this process */
-		if (should_track_process(tracker, comm, pid, ppid)) {
+		if (admit_process(tracker, comm, pid, ppid)) {
 			if (pid_tracker_add(tracker, pid, ppid)) {
 				tracked_count++;
 			} else if (env.verbose) {
@@ -488,7 +570,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				pid_tracker_remove(tracker, e->pid);
 
 				// Only report if tracked (or if in ALL/PROC mode)
-				if (!is_tracked && tracker->filter_mode == FILTER_MODE_FILTER) {
+				if (!is_tracked && (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled)) {
 					break;
 				}
 
@@ -523,7 +605,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				flush_pid_file_opens(e->pid, timestamp_ns);
 			} else {
 				// EXEC event: check if should track
-				if (should_track_process(tracker, e->comm, e->pid, e->ppid)) {
+				if (admit_process(tracker, e->comm, e->pid, e->ppid)) {
 					pid_tracker_add(tracker, e->pid, e->ppid);
 
 					// Report the EXEC event
@@ -537,8 +619,8 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 					printf(",\"full_command\":\"%s\"", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
 					printf("}\n");
 					fflush(stdout);
-				} else if (tracker->filter_mode == FILTER_MODE_FILTER) {
-					// In filter mode, don't report untracked processes
+				} else if (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled) {
+					// In filter mode or env-filter mode, don't report untracked processes
 					break;
 				} else {
 					// In ALL/PROC modes, report all processes but add them to tracker for PROC mode
@@ -562,7 +644,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 		case EVENT_TYPE_BASH_READLINE:
 			// Check if should report bash readline for this PID
-			if (!should_report_bash_readline(tracker, e->pid)) {
+			if (!should_emit_event_for_pid(tracker, e->pid)) {
 				break;
 			}
 
@@ -583,7 +665,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			}
 
 			// Check if should report file ops for this PID
-			if (!should_report_file_ops(tracker, e->pid)) {
+			if (!should_emit_event_for_pid(tracker, e->pid)) {
 				break;
 			}
 
@@ -629,6 +711,13 @@ int main(int argc, char **argv)
 
 	/* Initialize userspace PID tracker */
 	pid_tracker_init(&pid_tracker, env.command_list, env.command_count, env.filter_mode, env.pid);
+	if (env.env_tag[0] != '\0') {
+		if (!env_tag_filter_init(&g_env_tag_filter, env.env_tag)) {
+			fprintf(stderr, "Invalid --env-filter value (expect KEY=VALUE): %s\n", env.env_tag);
+			return 1;
+		}
+		fprintf(stderr, "env-filter enabled: only tracking processes with %s (and their children)\n", g_env_tag_filter.tag);
+	}
 
 	/* Set up libbpf errors and debug info callback */
 	libbpf_set_print(libbpf_print_fn);

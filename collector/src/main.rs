@@ -13,7 +13,8 @@ mod server;
 use framework::{
     binary_extractor::BinaryExtractor,
     runners::{SslRunner, StdioRunner, ProcessRunner, AgentRunner, SystemRunner, RunnerError, Runner},
-    analyzers::{OutputAnalyzer, FileLogger, SSEProcessor, HTTPParser, HTTPFilter, AuthHeaderRemover, SSLFilter, TimestampNormalizer, print_global_http_filter_metrics, print_global_ssl_filter_metrics}
+    analyzers::{OutputAnalyzer, FileLogger, SSEProcessor, HTTPParser, HTTPFilter, AuthHeaderRemover, SSLFilter, TimestampNormalizer, CmdlineEnricher, print_global_http_filter_metrics, print_global_ssl_filter_metrics},
+    core::PidCmdlineCache
 };
 
 use server::WebServer;
@@ -225,6 +226,10 @@ enum Commands {
         /// Path to the binary executable to monitor (e.g., ~/.nvm/versions/node/v20.0.0/bin/node)
         #[arg(long)]
         binary_path: Option<String>,
+        /// Only emit events from processes whose /proc/<pid>/environ contains
+        /// this exact KEY=VALUE entry (children inherit the tag).
+        #[arg(long)]
+        env_filter: Option<String>,
         /// Log file for output and server
         #[arg(short = 'o', long, default_value = "trace.log")]
         log_file: String,
@@ -253,6 +258,10 @@ enum Commands {
         /// Path to the binary executable to monitor (e.g., ~/.nvm/versions/node/v20.0.0/bin/node)
         #[arg(long)]
         binary_path: Option<String>,
+        /// Only emit events from processes whose /proc/<pid>/environ contains
+        /// this exact KEY=VALUE entry (children inherit the tag).
+        #[arg(long)]
+        env_filter: Option<String>,
         /// Log file for output and server
         #[arg(short = 'o', long, default_value = "record.log")]
         log_file: String,
@@ -326,8 +335,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Ssl { sse_merge, http_parser, http_raw_data, http_filter, disable_auth_removal, ssl_filter, quiet, rotate_logs, max_log_size, server, server_port, log_file, binary_path, args } => run_raw_ssl(&binary_extractor, *sse_merge, *http_parser, *http_raw_data, http_filter, *disable_auth_removal, ssl_filter, *quiet, *rotate_logs, *max_log_size, *server, *server_port, log_file, binary_path.as_deref(), args).await.map_err(convert_runner_error)?,
         Commands::Process { quiet, rotate_logs, max_log_size, server, server_port, log_file, args } => run_raw_process(&binary_extractor, *quiet, *rotate_logs, *max_log_size, *server, *server_port, log_file, args).await.map_err(convert_runner_error)?,
         Commands::Stdio { pid, uid, comm, all_fds, max_bytes, quiet, rotate_logs, max_log_size, server, server_port, log_file } => run_raw_stdio(&binary_extractor, *pid, *uid, comm.as_deref(), *all_fds, *max_bytes, *quiet, *rotate_logs, *max_log_size, *server, *server_port, log_file).await.map_err(convert_runner_error)?,
-        Commands::Trace { ssl, ssl_uid, pid, comm, ssl_filter, ssl_handshake, ssl_http, ssl_raw_data, process, stdio, stdio_uid, stdio_comm, stdio_all_fds, stdio_max_bytes, duration, mode, system, system_interval, http_filter, disable_auth_removal, binary_path, log_file, quiet, rotate_logs, max_log_size, server, server_port } => run_trace(&binary_extractor, *ssl, *pid, *ssl_uid, comm.as_deref(), ssl_filter, *ssl_handshake, *ssl_http, *ssl_raw_data, *process, *stdio, *stdio_uid, stdio_comm.as_deref(), *stdio_all_fds, *stdio_max_bytes, *duration, *mode, *system, *system_interval, http_filter, *disable_auth_removal, binary_path.as_deref(), log_file, *quiet, *rotate_logs, *max_log_size, *server, *server_port).await.map_err(convert_runner_error)?,
-        Commands::Record { comm, binary_path, log_file, rotate_logs, max_log_size, server_port } => {
+        Commands::Trace { ssl, ssl_uid, pid, comm, ssl_filter, ssl_handshake, ssl_http, ssl_raw_data, process, stdio, stdio_uid, stdio_comm, stdio_all_fds, stdio_max_bytes, duration, mode, system, system_interval, http_filter, disable_auth_removal, binary_path, env_filter, log_file, quiet, rotate_logs, max_log_size, server, server_port } => run_trace(&binary_extractor, *ssl, *pid, *ssl_uid, comm.as_deref(), ssl_filter, *ssl_handshake, *ssl_http, *ssl_raw_data, *process, *stdio, *stdio_uid, stdio_comm.as_deref(), *stdio_all_fds, *stdio_max_bytes, *duration, *mode, *system, *system_interval, http_filter, *disable_auth_removal, binary_path.as_deref(), env_filter.as_deref(), log_file, *quiet, *rotate_logs, *max_log_size, *server, *server_port).await.map_err(convert_runner_error)?,
+        Commands::Record { comm, binary_path, env_filter, log_file, rotate_logs, max_log_size, server_port } => {
             // Predefined filter patterns optimized for agent monitoring
             let http_filter_patterns = vec![
                 "request.path_prefix=/v1/rgstr | response.status_code=202 | request.method=HEAD | response.body=".to_string(),
@@ -337,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ];
 
             // Enable system monitoring by default for record command
-            run_trace(&binary_extractor, true, None, None, Some(comm), &ssl_filter_patterns, false, true, false, true, false, None, None, false, 8192, None, None, true, 2, &http_filter_patterns, false, binary_path.as_deref(), log_file, true, *rotate_logs, *max_log_size, true, *server_port).await.map_err(convert_runner_error)?
+            run_trace(&binary_extractor, true, None, None, Some(comm), &ssl_filter_patterns, false, true, false, true, false, None, None, false, 8192, None, None, true, 2, &http_filter_patterns, false, binary_path.as_deref(), env_filter.as_deref(), log_file, true, *rotate_logs, *max_log_size, true, *server_port).await.map_err(convert_runner_error)?
         },
         Commands::System { interval, pid, comm, no_children, cpu_threshold, memory_threshold, log_file, quiet, rotate_logs, max_log_size, server, server_port } => run_system(*interval, *pid, comm.as_deref(), !*no_children, *cpu_threshold, *memory_threshold, log_file, *quiet, *rotate_logs, *max_log_size, *server, *server_port).await.map_err(convert_runner_error)?,
     }
@@ -508,6 +517,23 @@ fn build_stdio_args(pid: u32, uid: Option<u32>, comm: Option<&str>, all_fds: boo
     args
 }
 
+/// Build stdiocap args WITHOUT -p PID, for when --env-filter is used to
+/// admit targets dynamically based on /proc/<pid>/environ.
+fn build_stdio_args_no_pid(uid: Option<u32>, comm: Option<&str>, all_fds: bool, max_bytes: u32) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(uid_filter) = uid {
+        args.extend(["-u".to_string(), uid_filter.to_string()]);
+    }
+    if let Some(comm_filter) = comm {
+        args.extend(["-c".to_string(), comm_filter.to_string()]);
+    }
+    if all_fds {
+        args.push("--all-fds".to_string());
+    }
+    args.extend(["--max-bytes".to_string(), max_bytes.to_string()]);
+    args
+}
+
 /// Show raw stdio events as JSON
 async fn run_raw_stdio(binary_extractor: &BinaryExtractor, pid: u32, uid: Option<u32>, comm: Option<&str>, all_fds: bool, max_bytes: u32, quiet: bool, rotate_logs: bool, max_log_size: u64, enable_server: bool, server_port: u16, log_file: &str) -> Result<(), RunnerError> {
     println!("Raw Stdio Events");
@@ -577,6 +603,7 @@ async fn run_trace(
     http_filter: &[String],
     disable_auth_removal: bool,
     binary_path: Option<&str>,
+    env_filter: Option<&str>,
     log_file: &str,
     quiet: bool,
     rotate_logs: bool,
@@ -618,6 +645,9 @@ async fn run_trace(
         }
         if let Some(path) = binary_path {
             ssl_args.extend(["--binary-path".to_string(), path.to_string()]);
+        }
+        if let Some(tag) = env_filter {
+            ssl_args.extend(["--env-filter".to_string(), tag.to_string()]);
         }
         if !ssl_args.is_empty() {
             ssl_runner = ssl_runner.with_args(&ssl_args);
@@ -663,15 +693,27 @@ async fn run_trace(
 
     // Add stdio runner if enabled
     if stdio_enabled {
-        let pid_filter = pid.ok_or_else(|| RunnerError::from("stdio capture currently requires --pid"))?;
+        // With --env-filter, stdiocap no longer requires --pid (the tag gates admission).
         let mut stdio_runner = StdioRunner::from_binary_extractor(binary_extractor.get_stdiocap_path()?);
-        let stdio_args = build_stdio_args(pid_filter, stdio_uid, stdio_comm, stdio_all_fds, stdio_max_bytes);
+        let mut stdio_args = if let Some(pid_filter) = pid {
+            build_stdio_args(pid_filter, stdio_uid, stdio_comm, stdio_all_fds, stdio_max_bytes)
+        } else if env_filter.is_some() {
+            build_stdio_args_no_pid(stdio_uid, stdio_comm, stdio_all_fds, stdio_max_bytes)
+        } else {
+            return Err(RunnerError::from("stdio capture requires --pid or --env-filter"));
+        };
+        if let Some(tag) = env_filter {
+            stdio_args.extend(["--env-filter".to_string(), tag.to_string()]);
+        }
 
         stdio_runner = stdio_runner.with_args(&stdio_args);
         stdio_runner = stdio_runner.add_analyzer(Box::new(TimestampNormalizer::new()));
 
         agent = agent.add_runner(Box::new(stdio_runner));
-        println!("✓ Stdio monitoring enabled for PID {}", pid_filter);
+        match pid {
+            Some(pid_filter) => println!("✓ Stdio monitoring enabled for PID {}", pid_filter),
+            None => println!("✓ Stdio monitoring enabled via --env-filter"),
+        }
     }
     
     // Add process runner if enabled
@@ -688,6 +730,9 @@ async fn run_trace(
         }
         if let Some(mode_filter) = mode {
             process_args.extend(["-m".to_string(), mode_filter.to_string()]);
+        }
+        if let Some(tag) = env_filter {
+            process_args.extend(["--env-filter".to_string(), tag.to_string()]);
         }
         if !process_args.is_empty() {
             process_runner = process_runner.with_args(&process_args);
@@ -727,6 +772,14 @@ async fn run_trace(
         return Err("At least one monitoring type must be enabled (--ssl, --process, --stdio, or --system)".into());
     }
     
+    // Global analyzer: cmdline enricher
+    // EXEC events carry full_command already; for every other source
+    // (FILE_OPEN, BASH_READLINE, ssl, stdio) we look up the PID in a
+    // shared cache. Must be installed BEFORE FileLogger/OutputAnalyzer so
+    // downstream consumers see the enriched field.
+    agent = agent.add_global_analyzer(Box::new(CmdlineEnricher::new(PidCmdlineCache::new())));
+    println!("✓ Cmdline enrichment enabled (full_command on all events)");
+
     // Add global analyzers (HTTP filter is now added to SSL runner instead)
 
     agent = agent.add_global_analyzer(Box::new(

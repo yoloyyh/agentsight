@@ -118,11 +118,11 @@ impl BinaryExecutor {
                             // Check severity of the message
                             if trimmed.contains("Failed") || trimmed.contains("Error") || 
                                trimmed.contains("cannot") || trimmed.contains("permission denied") {
-                                log::error!("{}STDERR: {}", runner_info, trimmed);
+                                log::error!("{}{}", runner_info, trimmed);
                             } else if trimmed.contains("warn") || trimmed.contains("Warning") {
-                                log::warn!("{}STDERR: {}", runner_info, trimmed);
+                                log::warn!("{}{}", runner_info, trimmed);
                             } else {
-                                log::info!("{}STDERR: {}", runner_info, trimmed);
+                                log::info!("{}{}", runner_info, trimmed);
                             }
                         }
                     }
