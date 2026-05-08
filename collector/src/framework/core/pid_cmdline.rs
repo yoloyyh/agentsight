@@ -150,14 +150,21 @@ fn bytes_to_cmdline(raw: &[u8]) -> String {
         Some(0) => &raw[..raw.len() - 1],
         _ => raw,
     };
-    let mut out = String::with_capacity(trimmed.len().min(MAX_CMDLINE_BYTES));
-    for &byte in trimmed.iter().take(MAX_CMDLINE_BYTES) {
-        let ch = if byte == 0 { b' ' } else { byte };
-        // cmdline can technically contain arbitrary bytes; push through
-        // lossy decoding to stay valid UTF-8 downstream.
-        out.push(ch as char);
+    // Cap at MAX_CMDLINE_BYTES on raw bytes first so we don't waste decode work.
+    let capped: &[u8] = if trimmed.len() > MAX_CMDLINE_BYTES {
+        &trimmed[..MAX_CMDLINE_BYTES]
+    } else {
+        trimmed
+    };
+    // Replace embedded NULs with spaces in the raw byte stream, then decode
+    // as UTF-8 with U+FFFD replacement for any invalid sequences (including
+    // multi-byte chars truncated mid-codepoint by upstream BPF buffers).
+    let mut buf: Vec<u8> = Vec::with_capacity(capped.len());
+    for &b in capped {
+        buf.push(if b == 0 { b' ' } else { b });
     }
-    sanitize_cmdline(out)
+    let decoded = String::from_utf8_lossy(&buf).into_owned();
+    sanitize_cmdline(decoded)
 }
 
 /// Replace embedded NULs with spaces, trim whitespace, cap length.
@@ -233,6 +240,32 @@ mod tests {
         cache.insert(1, "");
         cache.insert(2, "   ");
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_chinese_cmdline_roundtrip() {
+        // "python 这是测试.py" with NUL separators
+        let raw = b"python\0\xe8\xbf\x99\xe6\x98\xaf\xe6\xb5\x8b\xe8\xaf\x95.py\0";
+        let out = bytes_to_cmdline(raw);
+        assert_eq!(out, "python 这是测试.py");
+    }
+
+    #[test]
+    fn test_chinese_truncated_midcharacter_is_lossy() {
+        // "这是" is 6 bytes (E8 BF 99 E6 98 AF). Truncate after 4 bytes mid-codepoint.
+        let raw = b"\xe8\xbf\x99\xe6";
+        let out = bytes_to_cmdline(raw);
+        // First char survives; second is replaced with U+FFFD instead of dropping.
+        assert!(out.starts_with('这'));
+        assert!(out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_mixed_chinese_english_punct() {
+        // "echo 你好, world!"
+        let raw = b"echo\0\xe4\xbd\xa0\xe5\xa5\xbd, world!\0";
+        let out = bytes_to_cmdline(raw);
+        assert_eq!(out, "echo 你好, world!");
     }
 
     #[test]
