@@ -13,7 +13,8 @@ mod server;
 use framework::{
     binary_extractor::BinaryExtractor,
     runners::{SslRunner, StdioRunner, ProcessRunner, AgentRunner, SystemRunner, RunnerError, Runner},
-    analyzers::{OutputAnalyzer, FileLogger, SSEProcessor, HTTPParser, HTTPFilter, AuthHeaderRemover, SSLFilter, TimestampNormalizer, print_global_http_filter_metrics, print_global_ssl_filter_metrics}
+    analyzers::{OutputAnalyzer, FileLogger, SSEProcessor, HTTPParser, HTTPFilter, AuthHeaderRemover, SSLFilter, TimestampNormalizer, CmdlineEnricher, print_global_http_filter_metrics, print_global_ssl_filter_metrics},
+    core::PidCmdlineCache
 };
 
 use server::WebServer;
@@ -771,6 +772,14 @@ async fn run_trace(
         return Err("At least one monitoring type must be enabled (--ssl, --process, --stdio, or --system)".into());
     }
     
+    // Global analyzer: cmdline enricher
+    // EXEC events carry full_command already; for every other source
+    // (FILE_OPEN, BASH_READLINE, ssl, stdio) we look up the PID in a
+    // shared cache. Must be installed BEFORE FileLogger/OutputAnalyzer so
+    // downstream consumers see the enriched field.
+    agent = agent.add_global_analyzer(Box::new(CmdlineEnricher::new(PidCmdlineCache::new())));
+    println!("✓ Cmdline enrichment enabled (full_command on all events)");
+
     // Add global analyzers (HTTP filter is now added to SSL runner instead)
 
     agent = agent.add_global_analyzer(Box::new(
