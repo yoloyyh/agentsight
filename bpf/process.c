@@ -279,10 +279,10 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 	printf("{");
 	printf("\"timestamp\":%llu,", timestamp_ns);
 	printf("\"event\":\"FILE_OPEN\",");
-	printf("\"comm\":\"%s\",", e->comm);
+	print_json_str_field("comm", e->comm); printf(",");
 	printf("\"pid\":%d,", e->pid);
 	printf("\"count\":%u,", count);
-	printf("\"filepath\":\"%s\",", e->file_op.filepath);
+	print_json_str_field("filepath", e->file_op.filepath); printf(",");
 	printf("\"mode\":\"%s\",", resolve_open_mode(e->file_op.flags));
 	printf("\"flags\":%d", e->file_op.flags);
 	
@@ -577,7 +577,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				printf("{");
 				printf("\"timestamp\":%llu,", timestamp_ns);
 				printf("\"event\":\"EXIT\",");
-				printf("\"comm\":\"%s\",", e->comm);
+				print_json_str_field("comm", e->comm); printf(",");
 				printf("\"pid\":%d,", e->pid);
 				printf("\"ppid\":%d", e->ppid);
 				printf(",\"exit_code\":%u", e->exit_code);
@@ -612,11 +612,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 					printf("{");
 					printf("\"timestamp\":%llu,", timestamp_ns);
 					printf("\"event\":\"EXEC\",");
-					printf("\"comm\":\"%s\",", e->comm);
+					print_json_str_field("comm", e->comm); printf(",");
 					printf("\"pid\":%d,", e->pid);
 					printf("\"ppid\":%d", e->ppid);
-					printf(",\"filename\":\"%s\"", e->filename);
-					printf(",\"full_command\":\"%s\"", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+					printf(","); print_json_str_field("filename", e->filename);
+					printf(","); print_json_str_field("full_command", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+					if (e->cmdline_truncated) printf(",\"cmdline_truncated\":true");
 					printf("}\n");
 					fflush(stdout);
 				} else if (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled) {
@@ -631,11 +632,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 					printf("{");
 					printf("\"timestamp\":%llu,", timestamp_ns);
 					printf("\"event\":\"EXEC\",");
-					printf("\"comm\":\"%s\",", e->comm);
+					print_json_str_field("comm", e->comm); printf(",");
 					printf("\"pid\":%d,", e->pid);
 					printf("\"ppid\":%d", e->ppid);
-					printf(",\"filename\":\"%s\"", e->filename);
-					printf(",\"full_command\":\"%s\"", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+					printf(","); print_json_str_field("filename", e->filename);
+					printf(","); print_json_str_field("full_command", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+					if (e->cmdline_truncated) printf(",\"cmdline_truncated\":true");
 					printf("}\n");
 					fflush(stdout);
 				}
@@ -651,9 +653,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			printf("{");
 			printf("\"timestamp\":%llu,", timestamp_ns);
 			printf("\"event\":\"BASH_READLINE\",");
-			printf("\"comm\":\"%s\",", e->comm);
+			print_json_str_field("comm", e->comm); printf(",");
 			printf("\"pid\":%d,", e->pid);
-			printf("\"command\":\"%s\"", e->command);
+			print_json_str_field("command", e->command);
 			printf("}\n");
 			fflush(stdout);
 			break;

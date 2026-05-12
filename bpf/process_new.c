@@ -534,10 +534,10 @@ static void print_file_open_event(const struct event *e, uint64_t timestamp_ns, 
 	printf("{");
 	printf("\"timestamp\":%llu,", (unsigned long long)timestamp_ns);
 	printf("\"event\":\"FILE_OPEN\",");
-	printf("\"comm\":\"%s\",", e->comm);
+	print_json_str_field("comm", e->comm); printf(",");
 	printf("\"pid\":%d,", e->pid);
 	printf("\"count\":%u,", count);
-	printf("\"filepath\":\"%s\",", e->file_op.filepath);
+	print_json_str_field("filepath", e->file_op.filepath); printf(",");
 	printf("\"mode\":\"%s\",", resolve_open_mode(e->file_op.flags));
 	printf("\"flags\":%d", e->file_op.flags);
 	if (extra_fields && strlen(extra_fields) > 0)
@@ -733,9 +733,10 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 			if (!is_tracked && (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled))
 				break;
 
-			printf("{\"timestamp\":%llu,\"event\":\"EXIT\","
-			       "\"comm\":\"%s\",\"pid\":%d,\"ppid\":%d",
-			       (unsigned long long)timestamp_ns, e->comm, e->pid, e->ppid);
+			printf("{\"timestamp\":%llu,\"event\":\"EXIT\",",
+			       (unsigned long long)timestamp_ns);
+			print_json_str_field("comm", e->comm);
+			printf(",\"pid\":%d,\"ppid\":%d", e->pid, e->ppid);
 			printf(",\"exit_code\":%u", e->exit_code);
 			if (e->duration_ns)
 				printf(",\"duration_ms\":%llu", (unsigned long long)(e->duration_ns / 1000000));
@@ -784,11 +785,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 					bpf_map_update_elem(g_tracked_pids_fd, &bpf_pid, &val, BPF_ANY);
 				}
 
-				printf("{\"timestamp\":%llu,\"event\":\"EXEC\","
-				       "\"comm\":\"%s\",\"pid\":%d,\"ppid\":%d",
-				       (unsigned long long)timestamp_ns, e->comm, e->pid, e->ppid);
-				printf(",\"filename\":\"%s\"", e->filename);
-				printf(",\"full_command\":\"%s\"", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+				printf("{\"timestamp\":%llu,\"event\":\"EXEC\",",
+				       (unsigned long long)timestamp_ns);
+				print_json_str_field("comm", e->comm);
+				printf(",\"pid\":%d,\"ppid\":%d,", e->pid, e->ppid);
+				print_json_str_field("filename", e->filename);
+				printf(",");
+				print_json_str_field("full_command", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+				if (e->cmdline_truncated) printf(",\"cmdline_truncated\":true");
 
 				/* Memory info at exec */
 				struct proc_mem_info mem;
@@ -808,11 +812,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 				if (tracker->filter_mode == FILTER_MODE_PROC)
 					pid_tracker_add(tracker, e->pid, e->ppid);
 
-				printf("{\"timestamp\":%llu,\"event\":\"EXEC\","
-				       "\"comm\":\"%s\",\"pid\":%d,\"ppid\":%d",
-				       (unsigned long long)timestamp_ns, e->comm, e->pid, e->ppid);
-				printf(",\"filename\":\"%s\"", e->filename);
-				printf(",\"full_command\":\"%s\"", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+				printf("{\"timestamp\":%llu,\"event\":\"EXEC\",",
+				       (unsigned long long)timestamp_ns);
+				print_json_str_field("comm", e->comm);
+				printf(",\"pid\":%d,\"ppid\":%d,", e->pid, e->ppid);
+				print_json_str_field("filename", e->filename);
+				printf(",");
+				print_json_str_field("full_command", postprocess_full_command(e->full_command, MAX_COMMAND_LEN, e->exit_code));
+				if (e->cmdline_truncated) printf(",\"cmdline_truncated\":true");
 				print_container_fields(e->pid);
 				printf("}\n");
 				fflush(stdout);
@@ -823,9 +830,12 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	case EVENT_TYPE_BASH_READLINE:
 		if (!should_report_bash_readline(tracker, e->pid))
 			break;
-		printf("{\"timestamp\":%llu,\"event\":\"BASH_READLINE\","
-		       "\"comm\":\"%s\",\"pid\":%d,\"command\":\"%s\"}\n",
-		       (unsigned long long)timestamp_ns, e->comm, e->pid, e->command);
+		printf("{\"timestamp\":%llu,\"event\":\"BASH_READLINE\",",
+		       (unsigned long long)timestamp_ns);
+		print_json_str_field("comm", e->comm);
+		printf(",\"pid\":%d,", e->pid);
+		print_json_str_field("command", e->command);
+		printf("}\n");
 		fflush(stdout);
 		break;
 
