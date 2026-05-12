@@ -126,12 +126,22 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 					MAX_COMMAND_LEN - 1,
 					(void *)arg_start);
 		if (ret < 0) {
+			/*
+			 * argv user pages not yet faulted in (common on cold execve);
+			 * BPF can't trigger page faults, so probe_read_user returns
+			 * -EFAULT.  Fallback: emit comm only, mark as truncated, and
+			 * tell userspace not to treat the buffer as a sized argv block
+			 * (otherwise postprocess turns the trailing zeros into spaces).
+			 */
 			bpf_probe_read_kernel_str(e->full_command,
 					  sizeof(e->full_command),
 					  e->comm);
 			e->full_command[MAX_COMMAND_LEN - 1] = '\0';
+			arg_len = 0;
+			e->cmdline_truncated = true;
 		} else {
 			e->full_command[MAX_COMMAND_LEN - 1] = '\0';
+			e->cmdline_truncated = false;
 		}
 		/* Store actual arg_len in exit_code for userspace trimming.
 		 * exec events don't use exit_code, so this field is free. */
@@ -141,6 +151,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 		bpf_probe_read_kernel_str(e->full_command,
 				  sizeof(e->full_command), e->comm);
 		e->exit_code = 0;
+		e->cmdline_truncated = true;
 	}
 
 	/* successfully submit it to user-space for post-processing */

@@ -41,7 +41,22 @@ impl CmdlineEnricher {
         if event.source == "process" {
             match event_kind(&event.data) {
                 Some("EXEC") => {
-                    if let Some(cmd) = extract_full_command(&event.data) {
+                    // BPF marks cmdline_truncated=true when probe_read_user
+                    // failed and full_command holds only `comm`. In that case,
+                    // try /proc/<pid>/cmdline as a userspace fallback before
+                    // accepting the truncated value (and before polluting the
+                    // shared cache).
+                    if cmdline_truncated(&event.data) {
+                        if let Some(real) = cache.resolve(event.pid) {
+                            inject_full_command(&mut event.data, &real);
+                            clear_cmdline_truncated(&mut event.data);
+                            cache.insert(event.pid, real.as_ref());
+                        }
+                        // else: keep the comm-only value and the flag, do
+                        // NOT insert into cache so trailing events fall back
+                        // to /proc lookup themselves rather than re-using a
+                        // poisoned value.
+                    } else if let Some(cmd) = extract_full_command(&event.data) {
                         cache.insert(event.pid, cmd);
                     }
                     return event;
@@ -80,6 +95,12 @@ fn event_kind(data: &Value) -> Option<&str> {
     data.get("event").and_then(|v| v.as_str())
 }
 
+fn cmdline_truncated(data: &Value) -> bool {
+    data.get("cmdline_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn has_full_command(data: &Value) -> bool {
     data.get("full_command")
         .and_then(|v| v.as_str())
@@ -92,6 +113,12 @@ fn extract_full_command(data: &Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn clear_cmdline_truncated(data: &mut Value) {
+    if let Value::Object(map) = data {
+        map.remove("cmdline_truncated");
+    }
 }
 
 fn inject_full_command(data: &mut Value, cmd: &str) {
@@ -221,4 +248,75 @@ mod tests {
             Some("explicit")
         );
     }
+    #[tokio::test]
+    async fn test_truncated_exec_does_not_poison_cache() {
+        // When BPF marks cmdline_truncated=true and /proc lookup fails
+        // (pid does not exist), the cache must NOT be populated with the
+        // bare comm value, otherwise downstream FILE_OPEN events for the
+        // same PID would inherit a wrong cmdline.
+        let cache = PidCmdlineCache::new();
+        let mut enricher = CmdlineEnricher::new(cache.clone());
+        let input = stream::iter(vec![make_event(
+            "process",
+            999_999_999, // bogus pid, /proc lookup will fail
+            json!({
+                "event": "EXEC",
+                "pid": 999_999_999,
+                "full_command": "sh",
+                "cmdline_truncated": true,
+            }),
+        )]);
+        let _out: Vec<Event> = enricher
+            .process(Box::pin(input))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            cache.get_cached(999_999_999).is_none(),
+            "truncated EXEC must not poison cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_exec_falls_back_to_proc_for_self() {
+        // Use the current process pid: /proc/<self>/cmdline always exists,
+        // so the fallback path should both inject the real cmdline into the
+        // event and seed the cache with it.
+        let cache = PidCmdlineCache::new();
+        let mut enricher = CmdlineEnricher::new(cache.clone());
+        let my_pid = std::process::id();
+        let input = stream::iter(vec![make_event(
+            "process",
+            my_pid,
+            json!({
+                "event": "EXEC",
+                "pid": my_pid,
+                "full_command": "agentsight",
+                "cmdline_truncated": true,
+            }),
+        )]);
+        let out: Vec<Event> = enricher
+            .process(Box::pin(input))
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let injected = out[0]
+            .data
+            .get("full_command")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        // The fallback must replace the bare comm with the real cmdline.
+        assert!(
+            injected.len() >= "agentsight".len(),
+            "expected real cmdline (>= bare comm length), got {:?}",
+            injected
+        );
+        assert!(
+            cache.get_cached(my_pid).is_some(),
+            "successful /proc fallback should seed the cache"
+        );
+    }
+
 }

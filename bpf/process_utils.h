@@ -147,6 +147,90 @@ static int count_matching_processes(char **command_list, int command_count, bool
 
 
 
+
+/*
+ * json_escape_to_buf - Escape an arbitrary byte string into a JSON-safe form.
+ *
+ * Writes the escaped string into `out` (NUL-terminated). Returns the number
+ * of bytes written (excluding the trailing NUL). On overflow, the output is
+ * truncated on a safe boundary (never mid-escape) and still NUL-terminated.
+ *
+ * Escapes per RFC 8259: control chars 0x00..0x1F, 0x7F, double-quote, and
+ * backslash. Higher bytes pass through verbatim — we deliberately do NOT
+ * verify UTF-8 here because:
+ *   1. The Rust consumer uses lossy_decode_line() which replaces invalid
+ *      UTF-8 with U+FFFD before serde_json sees it, so the JSON parser is
+ *      never fed an invalid sequence.
+ *   2. Validating UTF-8 in C would require a state machine; keeping this
+ *      function byte-oriented matches the mental model "escape only what
+ *      JSON syntax requires".
+ *
+ * Usage:
+ *   char esc[MAX_COMMAND_LEN * 6 + 1];
+ *   json_escape_to_buf(raw, raw_len, esc, sizeof(esc));
+ *   printf("\"full_command\":\"%s\"", esc);
+ */
+static inline size_t json_escape_to_buf(const char *src, size_t src_len,
+                                        char *out, size_t out_size)
+{
+	if (!out || out_size == 0)
+		return 0;
+	size_t w = 0;
+	for (size_t i = 0; i < src_len; i++) {
+		unsigned char c = (unsigned char)src[i];
+		/* Worst case: 6 bytes for \u00XX + trailing NUL slot. */
+		if (w + 7 > out_size)
+			break;
+		switch (c) {
+		case '"':  out[w++] = '\\'; out[w++] = '"';  break;
+		case '\\': out[w++] = '\\'; out[w++] = '\\'; break;
+		case '\b': out[w++] = '\\'; out[w++] = 'b';  break;
+		case '\f': out[w++] = '\\'; out[w++] = 'f';  break;
+		case '\n': out[w++] = '\\'; out[w++] = 'n';  break;
+		case '\r': out[w++] = '\\'; out[w++] = 'r';  break;
+		case '\t': out[w++] = '\\'; out[w++] = 't';  break;
+		default:
+			if (c < 0x20 || c == 0x7F) {
+				static const char hex[] = "0123456789abcdef";
+				out[w++] = '\\';
+				out[w++] = 'u';
+				out[w++] = '0';
+				out[w++] = '0';
+				out[w++] = hex[(c >> 4) & 0xF];
+				out[w++] = hex[c & 0xF];
+			} else {
+				out[w++] = (char)c;
+			}
+		}
+	}
+	out[w] = '\0';
+	return w;
+}
+
+/*
+ * json_escape_cstr - convenience wrapper that takes a NUL-terminated string.
+ */
+static inline size_t json_escape_cstr(const char *src, char *out, size_t out_size)
+{
+	return json_escape_to_buf(src, src ? strlen(src) : 0, out, out_size);
+}
+
+
+/*
+ * print_json_str_field - emit `"key":"<escaped value>"` to stdout.
+ *
+ * Convenience for the (very common) pattern of writing a JSON string field
+ * with an arbitrary user-supplied value. The temporary escape buffer is
+ * sized for the worst case (every byte expands to \u00XX = 6 chars) of
+ * MAX_COMMAND_LEN bytes plus NUL.
+ */
+static inline void print_json_str_field(const char *key, const char *value)
+{
+	char esc[MAX_COMMAND_LEN * 6 + 1];
+	json_escape_cstr(value ? value : "", esc, sizeof(esc));
+	printf("\"%s\":\"%s\"", key, esc);
+}
+
 /*
  * postprocess_full_command - Convert raw argv bytes to a readable command string.
  *

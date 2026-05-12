@@ -41,6 +41,7 @@ struct event {
 		} file_op;
 	};
 	bool exit_event;
+	bool cmdline_truncated;  /* true when bpf_probe_read_user(argv) failed; full_command holds comm only */
 };
 
 struct command_filter {
