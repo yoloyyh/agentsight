@@ -15,8 +15,8 @@ clean:
 	cd frontend && rm -rf .next node_modules dist
 
 install:
-	sudo apt update
-	sudo apt-get install -y --no-install-recommends \
+	apt update
+	apt-get install -y --no-install-recommends \
         libelf1 libelf-dev zlib1g-dev \
         make clang llvm
 	# Install Node.js if not present
