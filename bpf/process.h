@@ -19,6 +19,7 @@ enum event_type {
 	EVENT_TYPE_PROCESS = 0,
 	EVENT_TYPE_BASH_READLINE = 1,
 	EVENT_TYPE_FILE_OPERATION = 2,
+	EVENT_TYPE_FORK = 3,
 };
 
 struct event {

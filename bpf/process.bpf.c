@@ -159,6 +159,31 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	return 0;
 }
 
+SEC("tp/sched/sched_process_fork")
+int handle_fork(struct trace_event_raw_sched_process_fork *ctx)
+{
+	struct event *e;
+
+	e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	e->type = EVENT_TYPE_FORK;
+	e->pid = ctx->child_pid;
+	e->ppid = ctx->parent_pid;
+	e->exit_code = 0;
+	e->duration_ns = 0;
+	e->timestamp_ns = bpf_ktime_get_ns();
+	e->exit_event = false;
+	e->cmdline_truncated = false;
+	__builtin_memset(e->full_command, 0, sizeof(e->full_command));
+	__builtin_memset(e->filename, 0, sizeof(e->filename));
+	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm), ctx->child_comm);
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
 SEC("tp/sched/sched_process_exit")
 int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 {
@@ -303,5 +328,4 @@ int trace_open(struct trace_event_raw_sys_enter *ctx)
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
-
 

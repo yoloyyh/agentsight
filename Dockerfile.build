@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:18-bullseye-slim AS node-bullseye
+
+FROM rust:1.95-bullseye AS rust-bullseye
+
+FROM debian:11-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    NEXT_TELEMETRY_DISABLED=1 \
+    npm_config_update_notifier=false
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    bison \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    file \
+    flex \
+    git \
+    libclang-dev \
+    libelf-dev \
+    libelf1 \
+    llvm \
+    make \
+    pkg-config \
+    python3 \
+    xz-utils \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=node-bullseye /usr/local/ /usr/local/
+COPY --from=rust-bullseye /usr/local/cargo/ /usr/local/cargo/
+COPY --from=rust-bullseye /usr/local/rustup/ /usr/local/rustup/
+
+RUN node --version && npm --version && rustc --version && cargo --version
+
+COPY . /app
+
+# Build frontend first so collector can embed ../frontend/dist/.
+RUN cd frontend && npm ci && npm run build
+
+# Build eBPF helpers and the release collector in the Debian 11 / GLIBC 2.31 environment.
+RUN make build-bpf && make build-rust
+
+# Collect the files typically needed for release packaging or downstream runtime images.
+RUN mkdir -p /out/bpf /out/frontend /out/collector \
+    && cp collector/target/release/agentsight /out/collector/agentsight \
+    && cp bpf/process /out/bpf/process \
+    && cp bpf/sslsniff /out/bpf/sslsniff \
+    && cp bpf/stdiocap /out/bpf/stdiocap \
+    && cp -a frontend/dist /out/frontend/dist
+
+FROM debian:11-slim AS artifacts
+
+WORKDIR /out
+
+COPY --from=builder /out/ /out/

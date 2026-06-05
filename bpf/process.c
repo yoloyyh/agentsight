@@ -563,14 +563,25 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	switch (e->type) {
 		case EVENT_TYPE_PROCESS:
 			if (e->exit_event) {
-				// EXIT event: check if tracked before reporting
+				// EXIT event: report tracked processes, and under --env-filter
+				// also keep short-lived children of tracked parents so
+				// subshell-only layers are not lost entirely.
 				bool is_tracked = pid_tracker_is_tracked(tracker, e->pid);
+				bool parent_tracked = pid_tracker_is_tracked(tracker, e->ppid);
 
 				// Remove from tracker regardless
 				pid_tracker_remove(tracker, e->pid);
 
-				// Only report if tracked (or if in ALL/PROC mode)
-				if (!is_tracked && (tracker->filter_mode == FILTER_MODE_FILTER || g_env_tag_filter.enabled)) {
+				// In env-filter mode, allow EXIT events from untracked children
+				// when their parent is already tracked. This preserves useful
+				// shell/subshell boundaries without fully disabling filtering.
+				if (!is_tracked && g_env_tag_filter.enabled && !parent_tracked) {
+					break;
+				}
+
+				// Outside env-filter mode, keep the existing behavior.
+				if (!is_tracked && !g_env_tag_filter.enabled &&
+				    tracker->filter_mode == FILTER_MODE_FILTER) {
 					break;
 				}
 
@@ -641,6 +652,15 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 					printf("}\n");
 					fflush(stdout);
 				}
+			}
+			break;
+
+		case EVENT_TYPE_FORK:
+			// Fork/clone can create short-lived shell layers that never emit
+			// EXEC. If the parent is already tracked, inherit tracking to the
+			// child early so its FILE_OPEN/EXIT events are not filtered out.
+			if (pid_tracker_is_tracked(tracker, e->ppid)) {
+				pid_tracker_add(tracker, e->pid, e->ppid);
 			}
 			break;
 

@@ -9,18 +9,21 @@ BPFTOOL ?= $(BPFTOOL_OUTPUT)/bootstrap/bpftool
 LIBBLAZESYM_SRC := $(abspath ..//blazesym/)
 LIBBLAZESYM_OBJ := $(abspath $(OUTPUT)/libblazesym.a)
 LIBBLAZESYM_HEADER := $(abspath $(OUTPUT)/blazesym.h)
-ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' \
+ARCH ?= $(shell uname -m)
+TARGET_ARCH := $(shell printf '%s' '$(ARCH)' | sed 's/x86_64/x86/' \
 			 | sed 's/arm.*/arm/' \
 			 | sed 's/aarch64/arm64/' \
 			 | sed 's/ppc64le/powerpc/' \
 			 | sed 's/mips.*/mips/' \
 			 | sed 's/riscv64/riscv/' \
 			 | sed 's/loongarch64/loongarch/')
-VMLINUX := ../vmlinux/$(ARCH)/vmlinux.h
+VMLINUX_DIR := ../vmlinux/$(TARGET_ARCH)
+VMLINUX_FALLBACK := $(firstword $(wildcard $(VMLINUX_DIR)/vmlinux_*.h))
+VMLINUX := $(if $(wildcard $(VMLINUX_DIR)/vmlinux.h),$(VMLINUX_DIR)/vmlinux.h,$(VMLINUX_FALLBACK))
 # Use our own libbpf API headers and Linux UAPI headers distributed with
 # libbpf to avoid dependency on system-wide headers, which could be missing or
 # outdated
-INCLUDES := -I$(OUTPUT) -I. -I../libbpf/include/uapi -I$(dir $(VMLINUX))
+INCLUDES := -I$(OUTPUT) -I. -I$(LIBBPF_SRC) -I../libbpf/include/uapi -I$(dir $(VMLINUX))
 CFLAGS := -g -Wall
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 
@@ -136,6 +139,11 @@ $(OUTPUT) $(OUTPUT)/libbpf $(BPFTOOL_OUTPUT):
 	$(call msg,MKDIR,$@)
 	$(Q)mkdir -p $@
 
+vmlinux.h: $(VMLINUX)
+	$(call msg,LINK,$@)
+	$(Q)rm -f $@
+	$(Q)cp $(abspath $(VMLINUX)) $@
+
 # Build libbpf
 $(LIBBPF_OBJ): $(wildcard $(LIBBPF_SRC)/*.[ch] $(LIBBPF_SRC)/Makefile) | $(OUTPUT)/libbpf
 	$(call msg,LIB,$@)
@@ -165,9 +173,9 @@ $(LIBBLAZESYM_HEADER): $(LIBBLAZESYM_SRC)/target/release/libblazesym.a | $(OUTPU
 $(OUTPUT)/process_new.bpf.o: $(wildcard process_ext/*.h)
 
 # Build BPF code
-$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) $(VMLINUX) | $(OUTPUT) $(BPFTOOL)
+$(OUTPUT)/%.bpf.o: %.bpf.c $(LIBBPF_OBJ) $(wildcard %.h) vmlinux.h | $(OUTPUT) $(BPFTOOL)
 	$(call msg,BPF,$@)
-	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)		      \
+	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(TARGET_ARCH)	      \
 		     $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES)		      \
 		     -c $(filter %.c,$^) -o $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
 	$(Q)$(BPFTOOL) gen object $@ $(patsubst %.bpf.o,%.tmp.bpf.o,$@)
